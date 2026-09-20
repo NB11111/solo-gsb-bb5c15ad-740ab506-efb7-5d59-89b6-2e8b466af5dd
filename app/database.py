@@ -223,6 +223,32 @@ def get_conn(path: Optional[str] = None):
 
 
 @contextmanager
+def read_transaction(path: Optional[str] = None):
+    """只读事务（BEGIN … COMMIT）：事务内全部读取共享同一一致性快照。
+
+    续切 G-code 导出必须在“同一 SQLite 读事务快照”中校验会话版本、读取
+    会话进度与方案 JSON：WAL 模式下读连接的快照在首次读时建立，显式 BEGIN
+    保证多次查询看到的是同一版本的数据，不会读到校验之后被并发写者推进的
+    状态。不获取写锁，不阻塞并发事件/换刀/批次提交。
+    """
+    target = path or DB_PATH
+    conn = sqlite3.connect(target, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN;")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK;")
+            raise
+        else:
+            conn.execute("COMMIT;")
+    finally:
+        conn.close()
+
+
+@contextmanager
 def transaction(path: Optional[str] = None):
     """写事务（BEGIN IMMEDIATE … COMMIT），用于“校验 + 推进”原子操作。
 

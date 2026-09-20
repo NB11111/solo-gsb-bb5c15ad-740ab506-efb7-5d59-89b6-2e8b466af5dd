@@ -141,6 +141,31 @@ class GcodeResponse(BaseModel):
     gcode: str
 
 
+class ResumeGcodeRequest(GcodeRequest):
+    """续切导出请求：在 origin/unit/safe_z 之外携带会话乐观锁版本。"""
+
+    expected_version: int = Field(
+        ..., ge=0, description="客户端看到的会话版本；与会话当前版本不一致时"
+                              "返回 409 并回传当前版本，不输出任何程序")
+
+
+class ResumeGcodeResponse(BaseModel):
+    session_id: str
+    plan_id: str
+    origin: str
+    unit: str
+    safe_z: float
+    version: int = Field(..., description="导出时读到的会话版本")
+    completed_cuts: int = Field(
+        ..., description="续切起点：此前已完成的刀数（程序从下一刀开始）")
+    line_count: int
+    total_cut_length: float = Field(
+        ..., description="续切程序内切割线长度之和（按 unit 计）")
+    cut_map: list[GcodeCutMapEntry] = Field(
+        ..., description="保留原始 panel_no/step；line 为续切程序内的新行号")
+    gcode: str
+
+
 class HealthOut(BaseModel):
     status: str
 

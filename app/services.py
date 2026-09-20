@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database as db
-from .gcode import generate_gcode, validate_plan_cuts
+from .gcode import generate_gcode, generate_resume_gcode, validate_plan_cuts
 from .models import (
     BLADE_EPS,
     BatchCutIn,
@@ -21,6 +21,7 @@ from .models import (
     CutEventRequest,
     GcodeRequest,
     PlanRequest,
+    ResumeGcodeRequest,
     StartSessionRequest,
 )
 from .nesting import build_payload, solve
@@ -105,6 +106,97 @@ def export_gcode(plan_id: str, req: GcodeRequest) -> Optional[dict]:
         unit=req.unit,
         safe_z=req.safe_z,
     )
+
+
+def export_session_gcode(session_id: str,
+                         req: ResumeGcodeRequest) -> Optional[dict]:
+    """按切割会话当前进度导出续切 G-code；会话不存在返回 None。
+
+    纯只读接口（不获取写锁、绝不改写会话状态）。在单个 SQLite 读事务
+    （同一一致性快照）中依次：
+      1. 读取会话行（JOIN 方案快照）——后续校验与渲染都基于该快照，
+         不会读到事务期间被并发事件/换刀/批次推进后的状态；
+      2. 会话已完成（无下一刀）-> 409 session_completed，不输出部分程序；
+      3. expected_version 与快照中的当前版本不一致（并发推进所致）->
+         409 version_conflict 并回传 current_version，不输出部分程序；
+      4. next_action=blade_change（下一刀会越过刀具寿命检查点）->
+         409 blade_change_required，设备须先确认换刀，不输出部分程序；
+      5. 复用全量导出同一套导出前几何校验（validate_plan_cuts），任一违规
+         抛 PlanGeometryError，不输出部分程序。
+    校验全过后，仅从 completed_cuts 对应的下一刀起生成程序：首个待切
+    母板直接进入，其后跨板各输出一次 M0 换板暂停；注释与 cut_map 保留
+    原始 panel_no/step，行号与总切长按续切新程序重算。
+    """
+    with db.read_transaction() as conn:
+        row = db.get_session(session_id, conn)
+        if row is None:
+            return None
+        plan = json.loads(row["plan_json"])
+        cuts = flatten_cuts(plan)
+        done = row["completed_cuts"]
+
+        # 2) 会话已完成：无刀可切，不输出程序
+        if row["status"] == "completed" or done >= len(cuts):
+            raise SessionConflictError({
+                "error": "session_completed",
+                "message": f"会话已完成（共 {row['total_cuts']} 刀），"
+                           "没有可续切的剩余切割线",
+                "current_version": row["version"],
+                "completed_cuts": done,
+                "total_cuts": row["total_cuts"],
+            })
+
+        # 3) 版本校验（同一快照内）：并发推进后回传当前版本
+        if req.expected_version != row["version"]:
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"expected_version={req.expected_version} 与当前版本 "
+                           f"{row['version']} 不一致（会话可能已被并发推进），"
+                           "未生成续切 G-code",
+                "expected_version": req.expected_version,
+                "current_version": row["version"],
+            })
+
+        # 4) 下一刀会越过刀具寿命检查点：必须先确认换刀，不输出程序
+        blade = _blade_view(row, cuts, done)
+        if blade["next_action"] == "blade_change":
+            nxt = cuts[done]
+            raise SessionConflictError({
+                "error": "blade_change_required",
+                "message": f"下一刀（第 {nxt['panel_no']} 板第 {nxt['step']} 刀，"
+                           f"切长 {nxt['length']}）会使累计切长超过刀片寿命 "
+                           f"{float(row['blade_life'])}，请先确认换刀后再导出"
+                           "续切 G-code",
+                "current_version": row["version"],
+                "next_action": "blade_change",
+                "blade_life": blade["blade_life"],
+                "blade_used": blade["blade_used"],
+                "blade_remaining": blade["blade_remaining"],
+                "next_cut": {"panel_no": nxt["panel_no"],
+                             "step": nxt["step"],
+                             "length": nxt["length"]},
+            })
+
+        # 5) 复用全量导出的几何校验：违规整体拒绝，不输出部分程序
+        violations = validate_plan_cuts(plan)
+        if violations:
+            raise PlanGeometryError(violations)
+
+        snapshot_version = row["version"]
+        snapshot_done = done
+
+    # 渲染为纯计算：所用数据全部来自上面的读事务快照
+    out = generate_resume_gcode(
+        plan,
+        plan_id=row["plan_id"],
+        session_id=session_id,
+        completed_cuts=snapshot_done,
+        origin=req.origin,
+        unit=req.unit,
+        safe_z=req.safe_z,
+    )
+    out["version"] = snapshot_version
+    return out
 
 
 # ---------------------------------------------------------------------------

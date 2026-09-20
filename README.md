@@ -15,7 +15,9 @@
   （下一刀越寿命则 `next_action=blade_change`，换刀确认归零已用切长并递增版本，
   并发换刀与切刀只有一方成功）；设备离线期间完成的切刀可按批次回传，
   服务端在单事务中对账（一致前缀仅跳过、其余连续匹配且不越过寿命检查点后
-  一次性推进）。
+  一次性推进）；还可按会话进度**只读导出续切 G-code**（同一 SQLite 快照校验
+  乐观锁版本，仅从下一刀起生成、跨板暂停，原始编号保留、行号总长重算，
+  已完成/版本不符/需换刀时 409 且不输出部分程序）。
 
 ---
 
@@ -551,6 +553,104 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
 整批不推进，补做换刀确认后重发即可。
 ```
 
+### `POST /api/v1/sessions/{session_id}/gcode` — 按进度导出续切 G-code
+
+切割进行到一半（或次日接着切）时，只导出**下一刀起的剩余程序**，避免重放
+已切过的刀。接口为**纯只读**：不获取写锁、不写任何表，会话 `version` /
+`completed_cuts` / `blade_used` 均保持不变。请求体在 G-code 三参数之外携带
+会话乐观锁版本：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `expected_version` | int, ≥0 | 客户端看到的会话版本；与当前版本不一致时返回 `409` 并回传当前版本 |
+| `origin` | `top_left` / `top_right` / `bottom_left` / `bottom_right` | 机床原点所在的母板角 |
+| `unit` | `mm` / `in` | 输出单位（`mm`→`G21`，`in`→`G20`） |
+| `safe_z` | number, >0 | 安全抬刀高度（按 `unit` 计） |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/gcode \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 5, "origin": "bottom_left", "unit": "mm", "safe_z": 5}'
+```
+
+服务端在**同一个 SQLite 只读事务快照**内完成全部校验与会话/方案读取（期间
+并发提交的事件/换刀/批次不会影响本次结果）：
+
+1. 会话已完成（无下一刀）→ `409 session_completed`，**不输出部分程序**；
+2. `expected_version` 与快照中的当前版本不一致（并发推进所致）→
+   `409 version_conflict`，`detail.current_version` 回传当前版本，客户端 GET
+   最新状态后重试即可，**不输出部分程序**；
+3. `next_action="blade_change"`（下一刀会越过刀具寿命检查点）→
+   `409 blade_change_required`，须先调用换刀确认接口再导出，
+   **不输出部分程序**；
+4. 方案切割线未通过与全量导出**同一套导出前几何校验** →
+   `409 invalid_plan_geometry`，**不输出部分程序**。
+
+校验通过后仅从 `completed_cuts` 对应的**下一刀**开始生成程序：**首个待切
+母板直接进入**（程序头之后即其板头，无前置暂停），**之后每跨一块母板就在
+该板前输出一次 `M0` 换板暂停**；刀位注释 `(P<母板号> S<step> V|H)` 与
+`cut_map` **保留原始 `panel_no` / `step`**（不重新编号），而 `cut_map[].line`、
+`line_count` 与 `total_cut_length` 都**按续切新程序从 1 重算**（只计剩余刀）。
+续切程序使用独立头部并在末尾以 `M2` 结束：
+
+```gcode
+(PANEL-NESTING-API GCODE RESUME EXPORT)
+(SESSION 3f8c…)
+(PLAN a6df23c6-…)
+(RESUME AFTER COMPLETED_CUTS 5)
+(ORIGIN bottom_left; UNIT mm; SAFE_Z 5.000)
+G21
+G90
+G17
+G0 Z5.000
+(PANEL 1 OF 2: 244.000 X 122.000 mm)
+(P1 S3 V)
+…
+M0 (CHANGE TO PANEL 2)
+(PANEL 2 OF 2: 244.000 X 122.000 mm)
+(P2 S1 H)
+…
+M2
+```
+
+响应（`200`）：
+
+```jsonc
+{
+  "session_id": "3f8c…",
+  "plan_id": "a6df23c6-…",
+  "origin": "bottom_left",
+  "unit": "mm",
+  "safe_z": 5.0,
+  "version": 5,                  // 导出快照中的会话版本
+  "completed_cuts": 5,           // 续切起点：此前已完成 5 刀
+  "line_count": 21,              // 续切程序行数（自 1 重算）
+  "total_cut_length": 364.0,     // 仅剩余切割线长度之和（按 unit 计）
+  "cut_map": [                   // 保留原始 panel_no/step；line 为新程序行号
+    {"panel_no": 1, "step": 3, "line": 13},
+    {"panel_no": 2, "step": 1, "line": 20}
+  ],
+  "gcode": "(PANEL-NESTING-API GCODE RESUME EXPORT)\n…M2\n"
+}
+```
+
+> `completed_cuts=0` 时续切程序的刀块部分与全量导出逐行一致（仅头部标识
+> 不同）；同一会话同一进度同一参数的导出逐字节确定，可安全重试。坐标变换、
+> 逐刀块格式（`G0`→`G1 Z0`→`G1`→`G0`）与几何校验均复用全量导出的实现。
+> 会话不存在返回 `404`；参数非法返回 `422`。
+
+#### 续切导出与并发推进的协作
+
+```text
+设备持有 version=5 的会话状态，请求导出续切 G-code（expected_version=5）
+  · 此时无并发推进 → 200，返回从第 6 刀起的程序（version 仍为 5，状态不变）
+  · 若另一终端/批次已把会话推进到 version=7 → 409 version_conflict，
+    detail.current_version=7；设备 GET 会话后以 expected_version=7 重新导出，
+    得到从第 8 刀起的新程序（旧响应未输出，不会拿到过期程序）
+  · 若第 6 刀会越过刀片寿命 → 409 blade_change_required；
+    先 blade-changes 再导出
+```
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -597,11 +697,11 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
 │   ├── main.py          # FastAPI 路由（方案/会话/事件/G-code/健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
-│   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
-│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事件/换刀/批次事务校验）
-│   ├── database.py      # SQLite 连接、建表与旧库迁移、plan_id 摘要、会话/版本流 CRUD、写事务
+│   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、全量/续切确定性文本生成
+│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事件/换刀/批次事务校验、续切只读快照导出）
+│   ├── database.py      # SQLite 连接、建表与旧库迁移、plan_id 摘要、会话/版本流 CRUD、读/写事务
 │   └── init_db.py       # python -m app.init_db 建库入口（含结构升级）
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话批次/刀具寿命与并发/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code 全量与续切/会话批次/刀具寿命与并发/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -625,5 +725,8 @@ python3 -m unittest discover -s tests -v
 跑完整个会话**，以及**刀具寿命检查点：启动参数与初始已用切长、寿命预判与
 恰好等于不越界、单刀拦截与换刀恢复、换刀幂等/版本冲突/未启用检查拒绝、
 批次任一待应用刀越界则整批 409、换刀版本节点下的批次对账、换刀与切刀并发
-唯一胜者、换刀同键全员重放、整会话多次换刀跑完全程**，和基于 TestClient 的
-HTTP 端到端。
+唯一胜者、换刀同键全员重放、整会话多次换刀跑完全程**，**续切 G-code：
+续切点在板中/板界的跨板暂停与首板直入、注释与 cut_map 保留原始编号、
+行号与总长按新程序重算、与全量导出刀块一致、确定性、已完成/旧版本回传当前
+版本/需先换刀/几何违规均 409 不输出部分程序、只读不推进会话、并发推进后
+旧版本 409、HTTP 端到端**，和基于 TestClient 的 HTTP 端到端。
