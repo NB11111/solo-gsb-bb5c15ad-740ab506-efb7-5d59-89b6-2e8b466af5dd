@@ -13,6 +13,8 @@
                                               确认换刀（归零已用切长，幂等）
   POST /api/v1/sessions/{session_id}/event-batches
                                               离线回传切刀批次（对账 + 幂等）
+  POST /api/v1/sessions/{session_id}/resume-gcode
+                                              按切割进度导出续切 G-code（只读）
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ from .models import (
     PlanRequest,
     PlanResponse,
     PlanSummary,
+    ResumeGcodeRequest,
+    ResumeGcodeResponse,
     SessionResponse,
     StartSessionRequest,
 )
@@ -43,6 +47,7 @@ from .services import (
     confirm_blade_change,
     create_plan,
     export_gcode,
+    export_resume_gcode,
     get_session_state,
     start_session,
     submit_cut_batch,
@@ -70,9 +75,12 @@ app = FastAPI(
         "blade_change，需先经换刀确认（归零已用切长、递增版本）才能继续；"
         "设备离线期间完成的切刀可按批次回传：服务端在单事务中将 base_version "
         "之后已完成区间与批次前缀逐项对账，一致前缀仅跳过，其余后缀连续匹配"
-        "当前方案且不越过寿命检查点后一次性推进。"
+        "当前方案且不越过寿命检查点后一次性推进。支持按会话进度只读导出"
+        "续切 G-code：在同一 SQLite 快照中校验乐观版本，仅从下一刀起生成"
+        "程序（首个待切母板直接进入、跨板各输出一次换板暂停），会话已完成"
+        "或待换刀时 409 且不输出部分程序。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -225,6 +233,34 @@ def post_session_event_batch(session_id: str,
         payload = submit_cut_batch(session_id, req)
     except SessionConflictError as exc:
         # 幂等键冲突/基线版本越界/对账或后缀不匹配：整批未推进
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/resume-gcode",
+    response_model=ResumeGcodeResponse,
+    tags=["sessions"],
+    summary="按切割进度导出续切 G-code（只读，版本快照校验）",
+)
+def post_session_resume_gcode(session_id: str,
+                              req: ResumeGcodeRequest) -> ResumeGcodeResponse:
+    try:
+        payload = export_resume_gcode(session_id, req)
+    except PlanGeometryError as exc:
+        # 校验失败：结构化错误，不输出任何部分 G-code
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "invalid_plan_geometry",
+                "message": "方案切割线未通过导出前几何校验，未生成任何 G-code",
+                "violations": exc.violations,
+            },
+        ) from exc
+    except SessionConflictError as exc:
+        # 版本不符/会话已完成/待换刀：状态未改动，不输出任何部分程序
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="会话不存在")

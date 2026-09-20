@@ -20,6 +20,8 @@ cut_session_blade_changes）：
 - 事件/批次/换刀推进走 transaction()（BEGIN IMMEDIATE）：校验与状态推进在
   同一事务中原子完成，并发写者由 SQLite 写锁串行化，旧版本/跳步请求不会推进
   状态，并发换刀与切刀只有一方成功。
+- 只读查询（如续切 G-code 导出的“版本 + 方案快照”校验）走
+  read_snapshot()（BEGIN … ROLLBACK）：事务内读共享同一快照且绝不写库。
 """
 from __future__ import annotations
 
@@ -218,6 +220,28 @@ def get_conn(path: Optional[str] = None):
     conn.execute("PRAGMA foreign_keys=ON;")
     try:
         yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def read_snapshot(path: Optional[str] = None):
+    """只读快照事务（BEGIN … ROLLBACK）：事务内所有读共享同一数据库快照。
+
+    用于“读会话版本 + 读方案快照”等必须彼此一致、且不得改动任何状态的
+    查询：BEGIN 后连接进入 deferred 事务，SQLite 保证事务内读不被并发提交
+    的写者影响（快照隔离）；结束统一 ROLLBACK，纯读操作绝不改写会话状态。
+    """
+    target = path or DB_PATH
+    conn = sqlite3.connect(target, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN;")
+        try:
+            yield conn
+        finally:
+            conn.execute("ROLLBACK;")
     finally:
         conn.close()
 

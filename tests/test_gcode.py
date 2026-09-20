@@ -10,6 +10,7 @@ import unittest
 from app.gcode import (
     MM_PER_INCH,
     generate_gcode,
+    generate_resume_gcode,
     to_machine,
     validate_plan_cuts,
 )
@@ -203,6 +204,138 @@ class TestGenerate(unittest.TestCase):
             generate_gcode(make_plan(), "p", "top_left", "cm", 5.0)
         with self.assertRaises(ValueError):
             generate_gcode(make_plan(), "p", "top_left", "mm", 0.0)
+
+
+def make_three_panel_plan():
+    """三块母板：板 1 两刀（V,H），板 2 一刀（H），板 3 一刀（V）。"""
+    plan = make_plan()
+    plan["summary"]["panels_used"] = 3
+    plan["summary"]["max_boards"] = 3
+    plan["panels"].append({
+        "panel_no": 3, "width": 244.0, "height": 122.0,
+        "placements": [],
+        "cuts": [
+            {"step": 1, "axis": "V", "x": 10.0, "y": 0.0,
+             "length": 122.0,
+             "region": {"x": 0.0, "y": 0.0,
+                        "width": 244.0, "height": 122.0}},
+        ],
+        "remnants": [],
+    })
+    return plan
+
+
+class TestGenerateResume(unittest.TestCase):
+    def test_start_zero_contains_all_remaining_cuts(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 0,
+                                    "top_left", "mm", 5.0)
+        body = out["gcode"].splitlines()
+        self.assertEqual(body[0], "(PANEL-NESTING-API RESUME GCODE EXPORT)")
+        self.assertIn("(SESSION sid-1)", body)
+        self.assertEqual(
+            [(e["panel_no"], e["step"]) for e in out["cut_map"]],
+            [(1, 1), (1, 2), (2, 1), (3, 1)],
+        )
+        # 三块待切母板 -> 板间恰好两次 M0；首个母板直接进入无前导暂停
+        self.assertEqual(out["gcode"].count("M0"), 2)
+
+    def test_resume_mid_panel_first_board_enters_directly(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 1,
+                                    "top_left", "mm", 5.0)
+        body = out["gcode"].splitlines()
+        # 已完成板 1 第 1 刀：程序直接从板 1 第 2 刀开始，无任何前导 M0
+        self.assertNotIn("(P1 S1 V)", body)
+        self.assertIn("(P1 S2 H)", body)
+        self.assertEqual(body.index("(P1 S2 H)") < body.index(
+            next(ln for ln in body if ln.startswith("M0"))), True)
+        self.assertEqual(
+            [(e["panel_no"], e["step"]) for e in out["cut_map"]],
+            [(1, 2), (2, 1), (3, 1)],
+        )
+        # 跨板各一次 M0：板1->板2、板2->板3
+        self.assertIn("M0 (CHANGE TO PANEL 2)", body)
+        self.assertIn("M0 (CHANGE TO PANEL 3)", body)
+        self.assertEqual(out["gcode"].count("M0"), 2)
+        # 板头仍写原始编号（OF 总数 3）
+        self.assertIn("(PANEL 1 OF 3:", "\n".join(body))
+
+    def test_resume_at_panel_boundary(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 2,  # 板 1 全完
+                                    "top_left", "mm", 5.0)
+        body = out["gcode"].splitlines()
+        self.assertNotIn("(P1 ", body)
+        self.assertEqual(
+            [(e["panel_no"], e["step"]) for e in out["cut_map"]],
+            [(2, 1), (3, 1)],
+        )
+        # 板 1 已完成：首个待切母板是板 2，直接进入，只有板2->板3 一次 M0
+        self.assertEqual(out["gcode"].count("M0"), 1)
+        self.assertIn("M0 (CHANGE TO PANEL 3)", body)
+        self.assertIn("(PANEL 2 OF 3:", "\n".join(body))
+
+    def test_resume_last_panel_no_m0(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 3,
+                                    "top_left", "mm", 5.0)
+        self.assertNotIn("M0", out["gcode"])
+        self.assertEqual(
+            [(e["panel_no"], e["step"]) for e in out["cut_map"]],
+            [(3, 1)],
+        )
+
+    def test_lines_and_total_length_recomputed(self):
+        plan = make_three_panel_plan()
+        full = generate_gcode(plan, "pid-1", "top_left", "mm", 5.0)
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 1,
+                                    "top_left", "mm", 5.0)
+        self.assertLess(out["line_count"], full["line_count"])
+        self.assertEqual(len(out["gcode"].splitlines()), out["line_count"])
+        self.assertEqual(
+            out["total_cut_length"], round(120.0 + 244.0 + 122.0, 6))
+        # cut_map 行号按新程序重算，且严格递增并指向 G1 切割移动
+        body = out["gcode"].splitlines()
+        prev = 0
+        for entry in out["cut_map"]:
+            self.assertTrue(body[entry["line"] - 1].startswith("G1 X"))
+            self.assertGreater(entry["line"], prev)
+            prev = entry["line"]
+
+    def test_resume_reuses_coordinate_transform(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 1,
+                                    "bottom_left", "mm", 5.0)
+        body = out["gcode"].splitlines()
+        # 板 1 第 2 刀 H：排样 (0,60)->(120,60)，bottom_left 镜像 y：
+        # 起点 (0,62)，终点 (120,62)
+        i = body.index("(P1 S2 H)")
+        self.assertEqual(body[i + 1], "G0 X0.000 Y62.000")
+        self.assertEqual(body[i + 3], "G1 X120.000 Y62.000")
+
+    def test_resume_deterministic(self):
+        plan = make_three_panel_plan()
+        a = generate_resume_gcode(plan, "p", "s", 1, "bottom_left", "mm", 5.0)
+        b = generate_resume_gcode(plan, "p", "s", 1, "bottom_left", "mm", 5.0)
+        self.assertEqual(a, b)
+
+    def test_resume_inches(self):
+        plan = make_three_panel_plan()
+        out = generate_resume_gcode(plan, "pid-1", "sid-1", 1,
+                                    "top_right", "in", 0.2)
+        self.assertIn("G20", out["gcode"])
+        self.assertNotIn("G21", out["gcode"])
+        self.assertAlmostEqual(
+            out["total_cut_length"],
+            round((120.0 + 244.0 + 122.0) / MM_PER_INCH, 6))
+
+    def test_start_index_out_of_range(self):
+        plan = make_three_panel_plan()
+        for bad in (-1, 4, 99):
+            with self.assertRaises(ValueError):
+                generate_resume_gcode(plan, "p", "s", bad,
+                                      "top_left", "mm", 5.0)
 
 
 class TestValidate(unittest.TestCase):

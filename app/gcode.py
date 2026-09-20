@@ -19,8 +19,10 @@
 
 程序结构（确定性：同方案同参数必得同一份文本，不含时间戳等易变量）：
 
-  (PANEL-NESTING-API GCODE EXPORT)
+  (PANEL-NESTING-API GCODE EXPORT)            整板导出
+  (PANEL-NESTING-API RESUME GCODE EXPORT)     按会话进度的续切导出
   (PLAN <plan_id>)
+  (SESSION <session_id>)                     仅续切导出
   (ORIGIN <origin>; UNIT <unit>; SAFE_Z <safe_z>)
   G21/G20            单位：mm / in
   G90                绝对坐标
@@ -37,10 +39,17 @@
   ...
   M2                 程序结束
 
+续切导出（generate_resume_gcode）：start_index 为已完成刀数，程序只含全局
+序列中其后的刀；首个待切母板（可能只剩余部分刀）直接进入，不输出前导暂停；
+其后每跨过一块母板输出一次 M0。定位注释与 cut_map 仍写原始 panel_no/step，
+行号与 total_cut_length 按新程序重新计算。
+
 响应同时给出 cut_map（源 panel_no/step -> 该刀 G1 切割移动的行号，1 起）
 与 total_cut_length（全部切割线长度之和，按输出单位计）。
 """
 from __future__ import annotations
+
+from typing import Optional
 
 MM_PER_INCH = 25.4
 
@@ -181,18 +190,35 @@ def validate_plan_cuts(plan: dict) -> list[dict]:
 # G-code 文本生成
 # ---------------------------------------------------------------------------
 
-def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
-                   safe_z: float) -> dict:
-    """按各母板 cuts.step 顺序生成确定性 G-code。
+def _remaining_panels(plan: dict, start_index: int) -> list[tuple[dict, list]]:
+    """从全局展平序列第 start_index 刀开始，选出 (母板, 该板待切刀) 列表。
 
-    参数：
-      plan     已存方案 payload（须先通过 validate_plan_cuts）
-      origin   机床原点角：top_left/top_right/bottom_left/bottom_right
-      unit     输出单位：mm(G21) / in(G20)
-      safe_z   安全抬刀高度（按 unit 计）
+    首个含待切刀的母板只保留 start_index 之后的刀（step 升序）；其后母板
+    保留全部刀；start_index 之前已整板完成的母板不出现在结果中。
+    """
+    groups: list[tuple[dict, list]] = []
+    passed = 0
+    for panel in plan.get("panels", []):
+        cuts = sorted(panel.get("cuts", []), key=lambda c: c["step"])
+        if passed + len(cuts) <= start_index:
+            passed += len(cuts)
+            continue
+        keep = cuts[start_index - passed:] if passed <= start_index else cuts
+        groups.append((panel, keep))
+        passed += len(cuts)
+    return groups
 
-    返回：plan_id/origin/unit/safe_z 回显 + line_count/total_cut_length/
-    cut_map/gcode 文本。
+
+def _render_program(plan: dict, plan_id: str, origin: str, unit: str,
+                    safe_z: float, banner: str,
+                    extra_header: Optional[str] = None,
+                    start_index: int = 0) -> dict:
+    """按各母板 cuts.step 顺序生成确定性 G-code（整板/续切共用渲染核心）。
+
+    start_index=0 导出全部母板（含无切割线的母板，保持整板导出现有行为）；
+    start_index>0 仅导出其后未完成的刀（见 _remaining_panels）。
+    banner/extra_header 为程序头部注释；N 始终取方案母板总数，使
+    “(PANEL p OF N)” 的原始 panel_no 编号可读。
     """
     if origin not in ORIGINS:
         raise ValueError(f"未知机床原点角: {origin}")
@@ -216,8 +242,10 @@ def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
     cut_map: list[dict] = []
     total_len_mm = 0.0
 
-    lines.append("(PANEL-NESTING-API GCODE EXPORT)")
+    lines.append(banner)
     lines.append(f"(PLAN {plan_id})")
+    if extra_header is not None:
+        lines.append(extra_header)
     lines.append(f"(ORIGIN {origin}; UNIT {unit}; SAFE_Z {z_safe})")
     lines.append("G21" if unit == "mm" else "G20")
     lines.append("G90")
@@ -226,7 +254,14 @@ def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
 
     panels = plan.get("panels", [])
     n_panels = len(panels)
-    for idx, panel in enumerate(panels):
+    if start_index > 0:
+        groups = _remaining_panels(plan, start_index)
+    else:
+        groups = [
+            (panel, sorted(panel.get("cuts", []), key=lambda c: c["step"]))
+            for panel in panels
+        ]
+    for idx, (panel, cuts) in enumerate(groups):
         pno = panel["panel_no"]
         bw = float(panel["width"])
         bh = float(panel["height"])
@@ -234,7 +269,7 @@ def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
             f"(PANEL {pno} OF {n_panels}: "
             f"{fmt(bw * scale)} X {fmt(bh * scale)} {unit})"
         )
-        for cut in sorted(panel.get("cuts", []), key=lambda c: c["step"]):
+        for cut in cuts:
             x1, y1, x2, y2 = cut_endpoints(cut)
             # 同一变换同时作用于起点与终点，走刀方向随之确定
             mx1, my1 = to_machine(x1, y1, bw, bh, origin)
@@ -250,9 +285,10 @@ def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
             })
             lines.append(f"G0 Z{z_safe}")
             total_len_mm += float(cut["length"])
-        if idx < n_panels - 1:
-            # 板间暂停换板（上一板末刀已抬刀到安全高度）
-            lines.append(f"M0 (CHANGE TO PANEL {panels[idx + 1]['panel_no']})")
+        if idx < len(groups) - 1:
+            # 板间暂停换板（上一板末刀已抬刀到安全高度）；首个待切母板直接进入
+            lines.append(
+                f"M0 (CHANGE TO PANEL {groups[idx + 1][0]['panel_no']})")
 
     lines.append("M2")
 
@@ -267,3 +303,49 @@ def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
         "cut_map": cut_map,
         "gcode": "\n".join(lines) + "\n",
     }
+
+
+def generate_gcode(plan: dict, plan_id: str, origin: str, unit: str,
+                   safe_z: float) -> dict:
+    """按各母板 cuts.step 顺序生成确定性 G-code（整板导出）。
+
+    参数：
+      plan     已存方案 payload（须先通过 validate_plan_cuts）
+      origin   机床原点角：top_left/top_right/bottom_left/bottom_right
+      unit     输出单位：mm(G21) / in(G20)
+      safe_z   安全抬刀高度（按 unit 计）
+
+    返回：plan_id/origin/unit/safe_z 回显 + line_count/total_cut_length/
+    cut_map/gcode 文本。
+    """
+    return _render_program(
+        plan, plan_id, origin, unit, safe_z,
+        banner="(PANEL-NESTING-API GCODE EXPORT)")
+
+
+def generate_resume_gcode(plan: dict, plan_id: str, session_id: str,
+                          start_index: int, origin: str, unit: str,
+                          safe_z: float) -> dict:
+    """按切割会话进度生成“续切”G-code：仅含 start_index 之后的刀。
+
+    参数：
+      plan         已存方案 payload（须先通过 validate_plan_cuts）
+      start_index  已完成刀数（completed_cuts）；0 表示从头切，须等于
+                   全局展平序列中已完成前缀长度
+      其余参数同 generate_gcode。
+
+    首个待切母板直接进入（即便其部分刀已完成），之后每跨一块母板输出一次
+    M0 换板暂停；定位注释 (P.. S..) 与 cut_map 保留原始 panel_no/step，
+    行号与 total_cut_length 按新程序重算。start_index 越界（没有待切刀）时
+    抛 ValueError——该情形由服务端在调用前以 409 拒绝。
+    """
+    total_cuts = sum(len(p.get("cuts", [])) for p in plan.get("panels", []))
+    if not 0 <= start_index < total_cuts:
+        raise ValueError(
+            f"start_index={start_index} 越界（总刀数 {total_cuts}），"
+            "没有可导出的待切刀")
+    return _render_program(
+        plan, plan_id, origin, unit, safe_z,
+        banner="(PANEL-NESTING-API RESUME GCODE EXPORT)",
+        extra_header=f"(SESSION {session_id})",
+        start_index=start_index)

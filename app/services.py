@@ -4,6 +4,10 @@
 “完成当前刀”事件、换刀确认与离线回传批次在单个 SQLite 写事务中完成幂等
 判定、版本/对账/刀具寿命校验、状态推进和事件/批次/换刀记录，并发/重试语义
 见 submit_cut_event、confirm_blade_change 与 submit_cut_batch。
+
+续切 G-code 导出（export_resume_gcode）是纯只读操作：在单个 SQLite 只读
+快照事务中校验会话版本与刀具寿命检查点，仅从 completed_cuts 对应的下一刀
+起生成程序，绝不改写会话状态。
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database as db
-from .gcode import generate_gcode, validate_plan_cuts
+from .gcode import generate_gcode, generate_resume_gcode, validate_plan_cuts
 from .models import (
     BLADE_EPS,
     BatchCutIn,
@@ -21,6 +25,7 @@ from .models import (
     CutEventRequest,
     GcodeRequest,
     PlanRequest,
+    ResumeGcodeRequest,
     StartSessionRequest,
 )
 from .nesting import build_payload, solve
@@ -105,6 +110,83 @@ def export_gcode(plan_id: str, req: GcodeRequest) -> Optional[dict]:
         unit=req.unit,
         safe_z=req.safe_z,
     )
+
+
+def export_resume_gcode(session_id: str,
+                        req: ResumeGcodeRequest) -> Optional[dict]:
+    """按切割会话进度导出“续切”G-code；会话不存在返回 None。
+
+    纯读操作：在同一个 SQLite 只读快照事务中读取会话行与其方案快照，
+    版本校验、进度判定与几何校验全部基于该快照，事务以 ROLLBACK 结束，
+    绝不改写会话状态。校验顺序：
+
+      1. expected_version 必须等于快照中的会话版本，否则 409
+         version_conflict（detail 带 current_version，客户端重读后重试）；
+      2. 会话已完成（status=completed 或无剩余刀）-> 409 session_completed，
+         不输出任何部分程序；
+      3. next_action=blade_change（下一刀会越过刀具寿命检查点）-> 409
+         blade_change_required，须先确认换刀，不输出任何部分程序；
+      4. 方案几何校验失败 -> 409 invalid_plan_geometry（同整板导出）。
+
+    通过后仅从 completed_cuts 对应的下一刀开始生成：首个待切母板直接进入，
+    其后每跨一块母板输出一次 M0 换板暂停；注释与 cut_map 保留原始
+    panel_no/step，行号与总切长按新程序重算。
+    """
+    with db.read_snapshot() as conn:
+        row = db.get_session(session_id, conn)
+        if row is None:
+            return None
+        current_version = row["version"]
+        if req.expected_version != current_version:
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"expected_version={req.expected_version} 与当前版本 "
+                           f"{current_version} 不一致（会话已被并发推进），"
+                           "未生成续切 G-code，请重读会话后重试",
+                "expected_version": req.expected_version,
+                "current_version": current_version,
+            })
+        plan = json.loads(row["plan_json"])
+        cuts = flatten_cuts(plan)
+        done = row["completed_cuts"]
+        if row["status"] == "completed" or done >= len(cuts):
+            raise SessionConflictError({
+                "error": "session_completed",
+                "message": f"会话已完成（共 {row['total_cuts']} 刀），"
+                           "没有待切刀，无需续切导出",
+                "current_version": current_version,
+                "total_cuts": row["total_cuts"],
+            })
+        blade = _blade_view(row, cuts, done)
+        if blade["next_action"] == "blade_change":
+            nxt = cuts[done]
+            raise SessionConflictError({
+                "error": "blade_change_required",
+                "message": f"下一刀（第 {nxt['panel_no']} 板第 {nxt['step']} 刀，"
+                           f"切长 {nxt['length']}）会越过刀具寿命检查点，"
+                           "请先确认换刀再导出续切 G-code，未生成任何程序",
+                "current_version": current_version,
+                "next_cut": {"panel_no": nxt["panel_no"],
+                             "step": nxt["step"],
+                             "length": nxt["length"]},
+                "next_action": "blade_change",
+            })
+        violations = validate_plan_cuts(plan)
+        if violations:
+            raise PlanGeometryError(violations)
+        payload = generate_resume_gcode(
+            plan,
+            plan_id=row["plan_id"],
+            session_id=session_id,
+            start_index=done,
+            origin=req.origin,
+            unit=req.unit,
+            safe_z=req.safe_z,
+        )
+        payload["session_id"] = session_id
+        payload["version"] = current_version
+        payload["completed_cuts"] = done
+        return payload
 
 
 # ---------------------------------------------------------------------------

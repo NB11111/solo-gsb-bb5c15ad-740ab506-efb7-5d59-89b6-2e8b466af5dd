@@ -141,6 +141,21 @@ class GcodeResponse(BaseModel):
     gcode: str
 
 
+class ResumeGcodeRequest(GcodeRequest):
+    """按切割会话进度导出续切 G-code：G-code 参数 + 会话乐观锁版本。"""
+    expected_version: int = Field(
+        ..., ge=0, description="客户端看到的会话版本（乐观锁）")
+
+
+class ResumeGcodeResponse(GcodeResponse):
+    """续切导出响应：在 GcodeResponse 之上回显会话快照信息。"""
+    session_id: str
+    version: int = Field(
+        ..., description="导出时读到的会话版本（= expected_version）")
+    completed_cuts: int = Field(
+        ..., description="导出时已完成刀数；程序从其后的第一刀开始")
+
+
 class HealthOut(BaseModel):
     status: str
 
